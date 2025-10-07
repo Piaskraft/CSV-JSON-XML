@@ -28,11 +28,24 @@ class Pk_Supplier_Hub extends Module
             && $this->installDb();
     }
 
+    /*
+     * UWAGA: Modyfikacja metody uninstall() zgodnie z załączonym zrzutem i nową logiką.
+     * Sprzątanie zakładek zostało przeniesione do tej metody.
+     */
     public function uninstall()
     {
-        return $this->uninstallTabs()
-            && $this->uninstallDb()
-            && parent::uninstall();
+        // najpierw wołamy rodzica
+        if (!parent::uninstall()) {
+            return false;
+        }
+
+        // Sprzątamy zakładki (wcześniej to było w returnie)
+        if (!$this->uninstallTabs()) {
+            return false;
+        }
+
+        // sprzątamy DB (DROP tabel z pliku sql/uninstall.sql)
+        return $this->uninstallDb();
     }
 
     /* ========== TABS (BO) ========== */
@@ -99,21 +112,11 @@ class Pk_Supplier_Hub extends Module
     protected function installDb()
     {
         $path = __DIR__ . '/sql/install.sql';
-        return $this->executeSqlFile($path);
-    }
-
-    protected function uninstallDb()
-    {
-        $path = __DIR__ . '/sql/uninstall.sql';
-        return $this->executeSqlFile($path);
-    }
-
-    protected function executeSqlFile($file)
-    {
-        if (!file_exists($file)) {
+        // Używamy zaimplementowanej w module logiki dla installDb (z pliku)
+        if (!file_exists($path)) {
             return false;
         }
-        $sql = Tools::file_get_contents($file);
+        $sql = Tools::file_get_contents($path);
         // Replace prefix & engine
         $sql = str_replace(
             ['PREFIX_', 'ENGINE_TYPE'],
@@ -129,6 +132,40 @@ class Pk_Supplier_Hub extends Module
         return true;
     }
 
+    /**
+     * Nowa, szczegółowa implementacja uninstallDb() z Twojej prośby.
+     * Zastępuje poprzednią prostszą wersję.
+     */
+    private function uninstallDb(): bool
+    {
+        $path = dirname(__FILE__).'/sql/uninstall.sql';
+        if (!file_exists($path)) {
+            return true; // nic do roboty (bezpiecznie przejść)
+        }
+
+        $sql = Tools::file_get_contents($path);
+        if ($sql === false) {
+            return false;
+        }
+
+        // Podmień placeholdery na realne wartości Presty
+        $sql = strtr($sql, [
+            'PREFIX_'    => _DB_PREFIX_,
+            'ENGINE_TYPE'  => _MYSQL_ENGINE_, // zostawione dla spójności z install.sql
+        ]);
+
+        // rozbij na pojedyncze komendy
+        $queries = array_filter(array_map('trim', preg_split('/;\s*[\r\n]+/', $sql)));
+        foreach ($queries as $q) {
+            if (!Db::getInstance()->execute($q)) {
+                return false;
+            }
+        }
+        return true;
+    }
+    
+    // Zostawiono tylko to co jest potrzebne do działania (usuwając poprzednie, prostsze uninstallDb() i executeSqlFile())
+    
     /* ========== CONFIG PAGE ========== */
 
     public function getContent()
