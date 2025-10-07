@@ -6,11 +6,18 @@ if (!defined('_PS_VERSION_')) { exit; }
  * - status: running|ok|error|aborted
  * - logi: action, old_price, new_price, old_qty, new_qty, reason, details
  * - snapshot: price, quantity, active (bez JSON)
+ * - batching: przetwarzanie w kawałkach (domyślnie 300)
  */
 class PkshRunService
 {
     /** @var Db */
     private $db;
+
+    /** Batch size (ile rekordów na „chunk”) */
+    private $batchSize = 300;
+
+    /** Co ile rekordów zapisywać „heartbeat” (progres runu) */
+    private $heartbeatEvery = 50;
 
     public function __construct()
     {
@@ -77,6 +84,18 @@ class PkshRunService
         return $this->db->update('pksh_run', $fields, 'id_run='.(int)$idRun);
     }
 
+    private function heartbeat(int $idRun, array $stats): void
+    {
+        // aktualizacja statystyk „w locie” (widać progres w BO/DB)
+        $fields = [
+            'updated'    => (int)$stats['updated'],
+            'skipped'    => (int)$stats['skipped'],
+            'errors'     => (int)$stats['errors'],
+            'updated_at' => date('Y-m-d H:i:s'),
+        ];
+        $this->db->update('pksh_run', $fields, 'id_run='.(int)$idRun);
+    }
+
     /* ========== LOGI & SNAPSHOTY ========== */
 
     public function log(int $idRun, string $action, array $data = []): bool
@@ -93,7 +112,7 @@ class PkshRunService
             'old_qty'              => isset($data['old_qty']) ? (int)$data['old_qty'] : null,
             'new_qty'              => isset($data['new_qty']) ? (int)$data['new_qty'] : null,
             'reason'               => isset($data['reason']) ? pSQL(Tools::substr((string)$data['reason'], 0, 255)) : null,
-            // ✔️ poprawka: start=0, length=65500
+            // ważne: tutaj length jest trzecim parametrem (start=0, length=65500)
             'details'              => isset($data['details']) ? pSQL(Tools::substr((string)$data['details'], 0, 65500)) : null,
             'created_at'           => date('Y-m-d H:i:s'),
         ];
@@ -137,7 +156,7 @@ class PkshRunService
 
     public function runReal(int $idSource, int $idRun): array
     {
-        // ✔️ GuardService dołączony do kontroli dostępności
+        // GuardService dołączony do kontroli dostępności
         $this->guardPipelineAvailability(['DiffService','StockUpdater','PriceUpdater','GuardService']);
 
         $diffService  = new DiffService();
@@ -156,104 +175,130 @@ class PkshRunService
         $items = $diff['items'];
         $stats['total'] = count($items);
 
-        foreach ($items as $row) {
-            $idProduct = (int)($row['id_product'] ?? 0);
-            $changes   = $row['changes'] ?? [];
-            $reason    = (string)($row['reason'] ?? '');
+        // od razu wpisz total, żeby BO widział rozmiar pracy
+        $this->db->update('pksh_run', [
+            'total'      => (int)$stats['total'],
+            'updated_at' => date('Y-m-d H:i:s'),
+        ], 'id_run='.(int)$idRun);
 
-            if ($idProduct <= 0 || empty($changes)) {
-                $this->log($idRun, 'skip', ['id_product'=>$idProduct, 'reason'=>'missing id_product or changes']);
-                $stats['skipped']++;
-                continue;
-            }
+        // PRZETWARZANIE W BATCHACH
+        $chunks = array_chunk($items, max(1, (int)$this->batchSize));
+        $processed = 0;
 
-            try {
-                // snapshot PRZED zmianą
-                $cur = $this->readCurrentProductState($idProduct);
-                $this->snapshot($idRun, $idProduct, $cur);
+        foreach ($chunks as $chunk) {
+            foreach ($chunk as $row) {
+                $processed++;
 
-                // GUARD #0 – walidacje twarde (EAN, negative price/qty, anomalie…)
-                $guard = new GuardService();
-                $guardRes = $guard->validateForUpdate($idProduct, $changes, $sourceCfg);
-                if (!$guardRes['ok']) {
-                    $this->log($idRun, 'skip', [
-                        'id_product' => $idProduct,
-                        'reason'     => $guardRes['reason'],
-                        'details'    => $guardRes['details'],
-                        'old_price'  => isset($cur['price']) ? (float)$cur['price'] : null,
-                        'new_price'  => isset($changes['price']) ? (float)$changes['price'] : null,
-                        'old_qty'    => isset($cur['quantity']) ? (int)$cur['quantity'] : null,
-                        'new_qty'    => isset($changes['quantity']) ? (int)$changes['quantity'] : null,
-                    ]);
+                $idProduct = (int)($row['id_product'] ?? 0);
+                $changes   = $row['changes'] ?? [];
+                $reason    = (string)($row['reason'] ?? '');
+
+                if ($idProduct <= 0 || empty($changes)) {
+                    $this->log($idRun, 'skip', ['id_product'=>$idProduct, 'reason'=>'missing id_product or changes']);
                     $stats['skipped']++;
+                    // heartbeat co N rekordów
+                    if (($processed % $this->heartbeatEvery) === 0) { $this->heartbeat($idRun, $stats); }
                     continue;
                 }
 
-                // GUARD #1 – max_delta_pct
-                if (isset($changes['price'])) {
-                    $newPrice = (float)$changes['price'];
-                    $oldPrice = isset($cur['price']) ? (float)$cur['price'] : null;
-                    $maxDelta = isset($sourceCfg['max_delta_pct']) ? (float)$sourceCfg['max_delta_pct'] : 50.0;
+                try {
+                    // snapshot PRZED zmianą
+                    $cur = $this->readCurrentProductState($idProduct);
+                    $this->snapshot($idRun, $idProduct, $cur);
 
-                    if ($oldPrice !== null && $oldPrice > 0.0) {
-                        $deltaPct = abs(($newPrice - $oldPrice) / $oldPrice * 100.0);
-                        if ($deltaPct > $maxDelta) {
-                            $this->log($idRun, 'skip', [
-                                'id_product' => $idProduct,
-                                'old_price'  => $oldPrice,
-                                'new_price'  => $newPrice,
-                                'reason'     => 'max_delta_pct',
-                                'details'    => 'Δ='.$deltaPct.'% > '.$maxDelta.'%',
-                            ]);
-                            $stats['skipped']++;
-                            unset($changes['price']); // pozwólmy nadal zmienić qty/active
+                    // GUARD #0 – twarde walidacje
+                    $guard = new GuardService();
+                    $guardRes = $guard->validateForUpdate($idProduct, $changes, $sourceCfg);
+                    if (!$guardRes['ok']) {
+                        $this->log($idRun, 'skip', [
+                            'id_product' => $idProduct,
+                            'reason'     => $guardRes['reason'],
+                            'details'    => $guardRes['details'],
+                            'old_price'  => isset($cur['price']) ? (float)$cur['price'] : null,
+                            'new_price'  => isset($changes['price']) ? (float)$changes['price'] : null,
+                            'old_qty'    => isset($cur['quantity']) ? (int)$cur['quantity'] : null,
+                            'new_qty'    => isset($changes['quantity']) ? (int)$changes['quantity'] : null,
+                        ]);
+                        $stats['skipped']++;
+                        if (($processed % $this->heartbeatEvery) === 0) { $this->heartbeat($idRun, $stats); }
+                        continue;
+                    }
+
+                    // GUARD #1 – max_delta_pct (lokalnie)
+                    if (isset($changes['price'])) {
+                        $newPrice = (float)$changes['price'];
+                        $oldPrice = isset($cur['price']) ? (float)$cur['price'] : null;
+                        $maxDelta = isset($sourceCfg['max_delta_pct']) ? (float)$sourceCfg['max_delta_pct'] : 50.0;
+
+                        if ($oldPrice !== null && $oldPrice > 0.0) {
+                            $deltaPct = abs(($newPrice - $oldPrice) / $oldPrice * 100.0);
+                            if ($deltaPct > $maxDelta) {
+                                $this->log($idRun, 'skip', [
+                                    'id_product' => $idProduct,
+                                    'old_price'  => $oldPrice,
+                                    'new_price'  => $newPrice,
+                                    'reason'     => 'max_delta_pct',
+                                    'details'    => 'Δ='.$deltaPct.'% > '.$maxDelta.'%',
+                                ]);
+                                $stats['skipped']++;
+                                unset($changes['price']); // pozwólmy nadal zmienić qty/active
+                            }
                         }
                     }
-                }
 
-                // ZAPIS: cena -> stan/aktywność
-                if (array_key_exists('price', $changes)) {
-                    $priceUpdater->apply($idProduct, [
-                        'price' => (float)$changes['price'],
-                        'id_shop' => (int)$sourceCfg['id_shop'],
-                        'mode' => (string)$sourceCfg['price_update_mode'],
-                        'tax_rule_group_id' => (int)$sourceCfg['tax_rule_group_id'],
-                    ], $idSource);
+                    // ZAPIS: cena -> stan/aktywność
+                    if (array_key_exists('price', $changes)) {
+                        $priceUpdater->apply($idProduct, [
+                            'price' => (float)$changes['price'],
+                            'id_shop' => (int)$sourceCfg['id_shop'],
+                            'mode' => (string)$sourceCfg['price_update_mode'],
+                            'tax_rule_group_id' => (int)$sourceCfg['tax_rule_group_id'],
+                        ], $idSource);
 
-                    $this->log($idRun, 'price', [
+                        $this->log($idRun, 'price', [
+                            'id_product' => $idProduct,
+                            'old_price'  => isset($cur['price']) ? (float)$cur['price'] : null,
+                            'new_price'  => (float)$changes['price'],
+                            'reason'     => $reason,
+                        ]);
+                    }
+
+                    if (array_key_exists('quantity', $changes) || array_key_exists('active', $changes)) {
+                        $stockUpdater->apply($idProduct, [
+                            'quantity' => $changes['quantity'] ?? null,
+                            'active'   => $changes['active'] ?? null,
+                            'id_shop'  => (int)$sourceCfg['id_shop'],
+                            'buffer'   => (int)$sourceCfg['stock_buffer'],
+                            'zero_qty_policy' => (string)$sourceCfg['zero_qty_policy'],
+                        ]);
+
+                        $this->log($idRun, 'stock', [
+                            'id_product' => $idProduct,
+                            'old_qty'    => isset($cur['quantity']) ? (int)$cur['quantity'] : null,
+                            'new_qty'    => isset($changes['quantity']) ? (int)$changes['quantity'] : null,
+                            'reason'     => $reason,
+                        ]);
+                    }
+
+                    $stats['updated']++;
+                } catch (\Throwable $e) {
+                    $this->log($idRun, 'error', [
                         'id_product' => $idProduct,
-                        'old_price'  => isset($cur['price']) ? (float)$cur['price'] : null,
-                        'new_price'  => (float)$changes['price'],
-                        'reason'     => $reason,
+                        'reason'     => 'exception',
+                        'details'    => $e->getMessage(),
                     ]);
+                    $stats['errors']++;
                 }
 
-                if (array_key_exists('quantity', $changes) || array_key_exists('active', $changes)) {
-                    $stockUpdater->apply($idProduct, [
-                        'quantity' => $changes['quantity'] ?? null,
-                        'active'   => $changes['active'] ?? null,
-                        'id_shop'  => (int)$sourceCfg['id_shop'],
-                        'buffer'   => (int)$sourceCfg['stock_buffer'],
-                        'zero_qty_policy' => (string)$sourceCfg['zero_qty_policy'],
-                    ]);
-
-                    $this->log($idRun, 'stock', [
-                        'id_product' => $idProduct,
-                        'old_qty'    => isset($cur['quantity']) ? (int)$cur['quantity'] : null,
-                        'new_qty'    => isset($changes['quantity']) ? (int)$changes['quantity'] : null,
-                        'reason'     => $reason,
-                    ]);
+                // heartbeat co N rekordów
+                if (($processed % $this->heartbeatEvery) === 0) {
+                    $this->heartbeat($idRun, $stats);
                 }
-
-                $stats['updated']++;
-            } catch (\Throwable $e) {
-                $this->log($idRun, 'error', [
-                    'id_product' => $idProduct,
-                    'reason'     => 'exception',
-                    'details'    => $e->getMessage(),
-                ]);
-                $stats['errors']++;
             }
+
+            // po każdym batchu – heartbeat + lekkie sprzątanie pamięci
+            $this->heartbeat($idRun, $stats);
+            if (function_exists('gc_collect_cycles')) { @gc_collect_cycles(); }
         }
 
         return $stats;

@@ -3,6 +3,10 @@ if (!defined('_PS_VERSION_')) {
     exit;
 }
 
+@require_once _PS_MODULE_DIR_.'pk_supplier_hub/classes/RunService.php';
+@require_once _PS_MODULE_DIR_.'pk_supplier_hub/classes/RollbackService.php';
+
+
 class AdminPkSupplierHubSourcesController extends ModuleAdminController
 {
     /** @var PkshRunService */
