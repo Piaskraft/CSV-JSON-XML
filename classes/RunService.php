@@ -1,18 +1,11 @@
 <?php
-if (!defined('_PS_VERSION_')) {
-    exit;
-}
+if (!defined('_PS_VERSION_')) { exit; }
 
 /**
- * PkshRunService
- *
- * Zadania:
- * - blokada równoległych runów (MySQL GET_LOCK)
- * - start/finish run (pksh_run)
- * - logi (pksh_log) i snapshoty (pksh_snapshot)
- * - wysokopoziomowe runDry/runReal, oparte o DiffService + Updatery
- *
- * Uwaga: Ten serwis NIE renderuje HTML — tylko logika i DB.
+ * RunService zgodny ze schematem z install.sql:
+ * - status: running|ok|error|aborted
+ * - logi: action, old_price, new_price, old_qty, new_qty, reason, details
+ * - snapshot: price, quantity, active (bez JSON)
  */
 class PkshRunService
 {
@@ -24,156 +17,140 @@ class PkshRunService
         $this->db = Db::getInstance();
     }
 
-    /* =========================
-     *  LOCK
-     * ========================= */
+    /* ========== LOCK (brak równoległych uruchomień) ========== */
 
-    /**
-     * Próbuje przejąć blokadę (brak równoległych runów).
-     * Zwraca true/false.
-     */
     public function acquireLock(): bool
     {
-        // MySQL advisory lock: 0s czekania, od razu 1/0
         $row = $this->db->getRow('SELECT GET_LOCK("pksh_run_lock", 0) AS l');
         return isset($row['l']) && (int)$row['l'] === 1;
     }
-
     public function releaseLock(): void
     {
         $this->db->execute('SELECT RELEASE_LOCK("pksh_run_lock")');
     }
 
-    /* =========================
-     *  RUN START/FINISH
-     * ========================= */
+    /* ========== RUN START/FINISH ========== */
 
     public function startRun(int $idSource, bool $dryRun, ?string $checksum = null): int
     {
         $now = date('Y-m-d H:i:s');
-        $data = [
-            'id_source'  => (int)$idSource,
-            'dry_run'    => (int)$dryRun,
-            'checksum'   => pSQL((string)$checksum),
-            'status'     => pSQL('running'),
-            'total'      => 0,
-            'updated'    => 0,
-            'skipped'    => 0,
-            'errors'     => 0,
-            'started_at' => pSQL($now),
-            'finished_at'=> null,
-        ];
-        $ok = $this->db->insert('pksh_run', $data);
+        $idShop = (int)$this->getSourceField($idSource, 'id_shop', 1);
+
+        $ok = $this->db->insert('pksh_run', [
+            'id_shop'     => $idShop,
+            'id_source'   => (int)$idSource,
+            'started_at'  => pSQL($now),
+            'finished_at' => null,
+            'status'      => pSQL('running'),
+            'total'       => 0,
+            'updated'     => 0,
+            'skipped'     => 0,
+            'errors'      => 0,
+            'dry_run'     => (int)$dryRun,
+            'locked'      => 1,
+            'checksum'    => pSQL((string)$checksum),
+            'message'     => null,
+            'created_at'  => pSQL($now),
+            'updated_at'  => pSQL($now),
+        ]);
         return $ok ? (int)$this->db->Insert_ID() : 0;
     }
 
-    public function finishRun(int $idRun, array $stats, string $status = 'success'): bool
+    public function finishRun(int $idRun, array $stats, string $status = 'ok', ?string $message = null): bool
     {
         $now = date('Y-m-d H:i:s');
         $fields = [
-            'status'      => pSQL($status),
+            'status'      => pSQL($status), // ok | error | aborted
             'finished_at' => pSQL($now),
+            'locked'      => 0,
+            'updated_at'  => pSQL($now),
         ];
         foreach (['total','updated','skipped','errors'] as $k) {
             if (isset($stats[$k])) {
                 $fields[$k] = (int)$stats[$k];
             }
         }
+        if ($message !== null) {
+            $fields['message'] = pSQL(Tools::substr($message, 0, 255));
+        }
         return $this->db->update('pksh_run', $fields, 'id_run='.(int)$idRun);
     }
 
-    /* =========================
-     *  LOGI & SNAPSHOTY
-     * ========================= */
+    /* ========== LOGI & SNAPSHOTY ========== */
 
-    public function log(int $idRun, string $type, string $message, ?int $idProduct = null, $before = null, $after = null): bool
+    public function log(int $idRun, string $action, array $data = []): bool
     {
-        // before/after jako JSON dla czytelności w logach
-        $data = [
-            'id_run'     => (int)$idRun,
-            'id_product' => $idProduct ? (int)$idProduct : null,
-            'type'       => pSQL($type),      // nochange|price|stock|skip|error|disable|enable|rollback
-            'message'    => pSQL(Tools::substr($message, 0, 1024)),
-            'before_json'=> $before !== null ? pSQL(json_encode($before, JSON_UNESCAPED_UNICODE)) : null,
-            'after_json' => $after  !== null ? pSQL(json_encode($after, JSON_UNESCAPED_UNICODE))  : null,
-            'created_at' => date('Y-m-d H:i:s'),
+        // $data: id_product?, id_product_attribute?, old_price?, new_price?, old_qty?, new_qty?, reason?, details?
+        $row = [
+            'id_run'               => (int)$idRun,
+            'id_product'           => isset($data['id_product']) ? (int)$data['id_product'] : null,
+            'id_product_attribute' => isset($data['id_product_attribute']) ? (int)$data['id_product_attribute'] : null,
+            'key_value'            => isset($data['key_value']) ? pSQL($data['key_value']) : null,
+            'action'               => pSQL($action), // price|stock|skip|error|nochange|disable|enable|rollback
+            'old_price'            => isset($data['old_price']) ? (float)$data['old_price'] : null,
+            'new_price'            => isset($data['new_price']) ? (float)$data['new_price'] : null,
+            'old_qty'              => isset($data['old_qty']) ? (int)$data['old_qty'] : null,
+            'new_qty'              => isset($data['new_qty']) ? (int)$data['new_qty'] : null,
+            'reason'               => isset($data['reason']) ? pSQL(Tools::substr((string)$data['reason'], 0, 255)) : null,
+            'details'              => isset($data['details']) ? pSQL(Tools::substr((string)$data['details'], 65500)) : null,
+            'created_at'           => date('Y-m-d H:i:s'),
         ];
-        return $this->db->insert('pksh_log', $data);
+        return $this->db->insert('pksh_log', $row);
     }
 
-    /**
-     * Zapis bieżącego stanu produktu PRZED zmianą (do rollbacku).
-     * $snapshot sugerowany format: ['price'=>.., 'quantity'=>.., 'active'=>.., 'id_shop'=>..]
-     */
-    public function snapshot(int $idRun, int $idProduct, array $snapshot): bool
+    public function snapshot(int $idRun, int $idProduct, array $state): bool
     {
-        $data = [
-            'id_run'     => (int)$idRun,
-            'id_product' => (int)$idProduct,
-            'data_json'  => pSQL(json_encode($snapshot, JSON_UNESCAPED_UNICODE)),
-            'created_at' => date('Y-m-d H:i:s'),
+        // $state: price?, quantity?, active?, id_product_attribute?
+        $row = [
+            'id_run'               => (int)$idRun,
+            'id_product'           => (int)$idProduct,
+            'id_product_attribute' => isset($state['id_product_attribute']) ? (int)$state['id_product_attribute'] : null,
+            'price'                => isset($state['price']) ? (float)$state['price'] : null,
+            'quantity'             => isset($state['quantity']) ? (int)$state['quantity'] : null,
+            'active'               => isset($state['active']) ? (int)$state['active'] : null,
+            'extra'                => isset($state['extra']) ? pSQL(json_encode($state['extra'], JSON_UNESCAPED_UNICODE)) : null,
+            'created_at'           => date('Y-m-d H:i:s'),
         ];
-        return $this->db->insert('pksh_snapshot', $data);
+        return $this->db->insert('pksh_snapshot', $row);
     }
 
-    /* =========================
-     *  HIGH LEVEL ORCHESTRATION
-     * ========================= */
+    /* ========== HIGH LEVEL: DRY / REAL ========== */
 
-    /**
-     * Wykonaj DRY RUN na podstawie istniejącego pipeline (Preview -> Diff)
-     * Zwraca tablicę statystyk.
-     */
     public function runDry(int $idSource): array
     {
-        $this->guardPipelineAvailability();
+        $this->guardPipelineAvailability(['DiffService']);
 
-        // 1) policz różnice (bez zapisu)
         $diffService = new DiffService();
-        $diff = $diffService->compute($idSource, [
-            'max_delta_pct_guard' => true, // wewnątrz DiffService powinien respektować guardy
-        ]);
-
-        // 2) Statystyki
-        $stats = [
-            'total'   => (int)$diff['total'] ?? 0,
-            'updated' => (int)$diff['affected'] ?? 0,
-            'skipped' => (int)$diff['skipped'] ?? 0,
-            'errors'  => (int)$diff['errors'] ?? 0,
-        ];
-        return $stats;
-    }
-
-    /**
-     * Wykonaj REAL RUN:
-     * - wykorzystuje DiffService do policzenia zmian,
-     * - używa PriceUpdater/StockUpdater do zapisu,
-     * - loguje efekty i snapshoty.
-     */
-    public function runReal(int $idSource, int $idRun): array
-    {
-        $this->guardPipelineAvailability();
-
-        $diffService   = new DiffService();
-        $stockUpdater  = new StockUpdater();
-        $priceUpdater  = new PriceUpdater();
-
         $diff = $diffService->compute($idSource, [
             'max_delta_pct_guard' => true,
         ]);
 
-        $stats = [
-            'total'   => 0,
-            'updated' => 0,
-            'skipped' => 0,
-            'errors'  => 0,
+        return [
+            'total'   => (int)($diff['total'] ?? 0),
+            'updated' => (int)($diff['affected'] ?? 0),
+            'skipped' => (int)($diff['skipped'] ?? 0),
+            'errors'  => (int)($diff['errors'] ?? 0),
         ];
+    }
+
+    public function runReal(int $idSource, int $idRun): array
+    {
+        $this->guardPipelineAvailability(['DiffService','StockUpdater','PriceUpdater']);
+
+        $diffService  = new DiffService();
+        $stockUpdater = new StockUpdater();
+        $priceUpdater = new PriceUpdater();
+
+        $sourceCfg = $this->getSourceConfig($idSource);
+
+        $diff = $diffService->compute($idSource, ['max_delta_pct_guard' => true]);
+        $stats = ['total'=>0,'updated'=>0,'skipped'=>0,'errors'=>0];
 
         if (!is_array($diff) || empty($diff['items'])) {
             return $stats;
         }
 
-        $items = $diff['items']; // każdy item: ['id_product', 'changes'=>['price'=>..,'quantity'=>..,'active'=>..], 'reason'=>...]
+        $items = $diff['items'];
         $stats['total'] = count($items);
 
         foreach ($items as $row) {
@@ -182,33 +159,80 @@ class PkshRunService
             $reason    = (string)($row['reason'] ?? '');
 
             if ($idProduct <= 0 || empty($changes)) {
-                $this->log($idRun, 'skip', 'Brak id_product lub brak changes', $idProduct, null, $changes);
+                $this->log($idRun, 'skip', ['id_product'=>$idProduct, 'reason'=>'missing id_product or changes']);
                 $stats['skipped']++;
                 continue;
             }
 
             try {
-                // snapshot PRZED zmianą
-                $snapshot = $this->readCurrentProductState($idProduct);
-                $this->snapshot($idRun, $idProduct, $snapshot);
+                // snapshot PRZED
+                $cur = $this->readCurrentProductState($idProduct);
+                $this->snapshot($idRun, $idProduct, $cur);
 
-                // kolejność: cena -> stan/aktywność (żeby spec_price nie dostał wyzerowanej ceny)
+                /* GUARD: max_delta_pct (jeśli Diff podał delta; fallback liczymy sami) */
                 if (isset($changes['price'])) {
-                    $priceUpdater->apply($idProduct, $changes['price'], $idSource);
-                    $this->log($idRun, 'price', 'Zmieniono cenę '.$reason, $idProduct, ['price'=>$snapshot['price'] ?? null], ['price'=>$changes['price']]);
+                    $newPrice = (float)$changes['price'];
+                    $oldPrice = isset($cur['price']) ? (float)$cur['price'] : null;
+                    $maxDelta = isset($sourceCfg['max_delta_pct']) ? (float)$sourceCfg['max_delta_pct'] : 50.0;
+
+                    if ($oldPrice !== null && $oldPrice > 0.0) {
+                        $deltaPct = abs(($newPrice - $oldPrice) / $oldPrice * 100.0);
+                        if ($deltaPct > $maxDelta) {
+                            $this->log($idRun, 'skip', [
+                                'id_product' => $idProduct,
+                                'old_price'  => $oldPrice,
+                                'new_price'  => $newPrice,
+                                'reason'     => 'max_delta_pct',
+                                'details'    => 'Δ='.$deltaPct.'% > '.$maxDelta.'%',
+                            ]);
+                            $stats['skipped']++;
+                            // usuń zmianę ceny, ale pozwól wykonać qty/active
+                            unset($changes['price']);
+                        }
+                    }
                 }
-                if (isset($changes['quantity']) || isset($changes['active'])) {
+
+                /* ZAPIS: cena -> stan/aktywność */
+                if (array_key_exists('price', $changes)) {
+                    $priceUpdater->apply($idProduct, [
+                        'price' => (float)$changes['price'],
+                        'id_shop' => (int)$sourceCfg['id_shop'],
+                        'mode' => (string)$sourceCfg['price_update_mode'],
+                        'tax_rule_group_id' => (int)$sourceCfg['tax_rule_group_id'],
+                    ], $idSource);
+
+                    $this->log($idRun, 'price', [
+                        'id_product' => $idProduct,
+                        'old_price'  => isset($cur['price']) ? (float)$cur['price'] : null,
+                        'new_price'  => (float)$changes['price'],
+                        'reason'     => $reason,
+                    ]);
+                }
+
+                if (array_key_exists('quantity', $changes) || array_key_exists('active', $changes)) {
                     $stockUpdater->apply($idProduct, [
                         'quantity' => $changes['quantity'] ?? null,
                         'active'   => $changes['active'] ?? null,
-                        'id_shop'  => $changes['id_shop'] ?? null,
-                    ], $idSource);
-                    $this->log($idRun, 'stock', 'Zmieniono stan/aktywność '.$reason, $idProduct, ['quantity'=>$snapshot['quantity'] ?? null, 'active'=>$snapshot['active'] ?? null], ['quantity'=>$changes['quantity'] ?? null, 'active'=>$changes['active'] ?? null]);
+                        'id_shop'  => (int)$sourceCfg['id_shop'],
+                        'buffer'   => (int)$sourceCfg['stock_buffer'],
+                        'zero_qty_policy' => (string)$sourceCfg['zero_qty_policy'],
+                    ]);
+
+                    $this->log($idRun, 'stock', [
+                        'id_product' => $idProduct,
+                        'old_qty'    => isset($cur['quantity']) ? (int)$cur['quantity'] : null,
+                        'new_qty'    => isset($changes['quantity']) ? (int)$changes['quantity'] : null,
+                        'reason'     => $reason,
+                    ]);
                 }
 
                 $stats['updated']++;
             } catch (\Throwable $e) {
-                $this->log($idRun, 'error', 'Wyjątek: '.$e->getMessage(), $idProduct, $changes, null);
+                $this->log($idRun, 'error', [
+                    'id_product' => $idProduct,
+                    'reason'     => 'exception',
+                    'details'    => $e->getMessage(),
+                ]);
                 $stats['errors']++;
             }
         }
@@ -216,34 +240,41 @@ class PkshRunService
         return $stats;
     }
 
-    /**
-     * Prosty odczyt bieżącego stanu produktu (cena, qty, active).
-     * Jeśli używasz kombinacji/spec_price — możesz rozszerzyć pod swoje pole.
-     */
+    /* ========== HELPERS ========== */
+
     private function readCurrentProductState(int $idProduct): array
     {
         $row = $this->db->getRow('
             SELECT p.active, p.price, IFNULL(sa.quantity, 0) as quantity
             FROM '._DB_PREFIX_.'product p
-            LEFT JOIN '._DB_PREFIX_.'stock_available sa ON sa.id_product=p.id_product AND sa.id_product_attribute=0
+            LEFT JOIN '._DB_PREFIX_.'stock_available sa
+                ON sa.id_product=p.id_product AND sa.id_product_attribute=0
             WHERE p.id_product='.(int)$idProduct
         );
         return is_array($row) ? $row : [];
     }
 
-    /**
-     * Upewnia się, że pipeline istnieje — w razie braków (np. DiffService)
-     * rzuci wyjątek z czytelnym komunikatem.
-     */
-    private function guardPipelineAvailability(): void
+    private function getSourceConfig(int $idSource): array
     {
-        $required = ['DiffService']; // Updatery też:
-        foreach ($required as $class) {
+        $row = $this->db->getRow('SELECT id_shop, price_update_mode, tax_rule_group_id, zero_qty_policy, stock_buffer, max_delta_pct
+            FROM '._DB_PREFIX_.'pksh_source WHERE id_source='.(int)$idSource);
+        if (!$row) {
+            $row = ['id_shop'=>1,'price_update_mode'=>'impact','tax_rule_group_id'=>0,'zero_qty_policy'=>'disable','stock_buffer'=>0,'max_delta_pct'=>50.0];
+        }
+        return $row;
+    }
+
+    private function getSourceField(int $idSource, string $field, $default = null)
+    {
+        return $this->db->getValue('SELECT `'.pSQL($field).'` FROM '._DB_PREFIX_.'pksh_source WHERE id_source='.(int)$idSource) ?: $default;
+    }
+
+    private function guardPipelineAvailability(array $classes): void
+    {
+        foreach ($classes as $class) {
             if (!class_exists($class)) {
-                throw new \RuntimeException('Brak klasy w pipeline: '.$class.'. Upewnij się, że został wgrany plik z implementacją.');
+                throw new \RuntimeException('Brak klasy: '.$class);
             }
         }
-        // Updatery mogą być leniwie wymagane tylko w real run:
-        // Sprawdzane dopiero w runReal przy new PriceUpdater/StockUpdater (jeśli brak — \Throwable poleci do logów)
     }
 }
