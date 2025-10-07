@@ -385,7 +385,7 @@ class DiffService
             LEFT JOIN '._DB_PREFIX_.'stock_available sa
                 ON sa.id_product=ps.id_product AND sa.id_product_attribute=0 AND sa.id_shop='.(int)$idShop.'
             WHERE ps.id_product='.(int)$idProduct.' AND ps.id_shop='.(int)$idShop
-        ');
+        );
         return $row ?: null;
     }
 

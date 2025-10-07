@@ -210,29 +210,60 @@ class Pk_Supplier_Hub extends Module
      *  CONFIG PAGE (DASHBOARD)
      * ========================= */
 
-    public function getContent()
-    {
-        $html = '';
+   public function getContent()
+{
+    $html = '';
 
-        if (Tools::isSubmit('submit' . $this->name)) {
-            $html .= $this->displayConfirmation($this->l('Settings saved.'));
-        }
-
-        $linkSources = $this->context->link->getAdminLink('AdminPkSupplierHubSources');
-        $linkRuns    = $this->context->link->getAdminLink('AdminPkSupplierHubRuns');
-
-        $html .= '<div class="panel">';
-        $html .= '<h3><i class="icon icon-cogs"></i> ' . $this->displayName . '</h3>';
-        $html .= '<p>' . $this->l('Hub do synchronizacji cen i stanów z wieloma dostawcami.') . '</p>';
-
-        $html .= '<div class="well">';
-        $html .= '<a class="btn btn-primary" href="' . htmlspecialchars($linkSources) . '"><i class="icon-download"></i> ' . $this->l('Open: Sources') . '</a> ';
-        $html .= '<a class="btn btn-default" href="' . htmlspecialchars($linkRuns) . '"><i class="icon-list"></i> ' . $this->l('Open: Runs & Logs') . '</a>';
-        $html .= '</div>';
-
-        $html .= '<p class="help-block">' . $this->l('Na początek: dodaj źródło dostawcy, wykonaj Dry Run, sprawdź diff, potem Real Run.') . '</p>';
-        $html .= '</div>';
-
-        return $html;
+    // Zapis ustawień modułu
+    if (Tools::isSubmit('submit'.$this->name)) {
+        $html .= $this->displayConfirmation($this->l('Settings saved.'));
     }
+
+    // Regeneracja tokena CRON
+    if (Tools::isSubmit('regeneratePkshToken')) {
+        $new = Tools::substr(sha1(_COOKIE_KEY_.microtime(true).mt_rand()), 0, 28);
+        Configuration::updateValue('PKSH_CRON_TOKEN', $new);
+        $html .= $this->displayConfirmation($this->l('CRON token regenerated.'));
+    }
+
+    // Pobranie tokena (lub wygenerowanie jeśli brak)
+    $token = Configuration::get('PKSH_CRON_TOKEN');
+    if (empty($token)) {
+        $token = Tools::substr(sha1(_COOKIE_KEY_.microtime(true)), 0, 28);
+        Configuration::updateValue('PKSH_CRON_TOKEN', $token);
+    }
+
+    $linkSources = $this->context->link->getAdminLink('AdminPkSupplierHubSources');
+    $linkRuns    = $this->context->link->getAdminLink('AdminPkSupplierHubRuns');
+
+    // Przykładowe URL-e CRON (bez domeny — dev sobie wstawi swój host)
+    $cronPatternDry  = '/module/pk_supplier_hub/cron?token='.urlencode($token).'&id_source={ID}&dry=1';
+    $cronPatternReal = '/module/pk_supplier_hub/cron?token='.urlencode($token).'&id_source={ID}&dry=0';
+
+    $html .= '<div class="panel">';
+    $html .= '<h3><i class="icon icon-cogs"></i> '.$this->displayName.'</h3>';
+    $html .= '<p>'.$this->l('Hub do synchronizacji cen i stanów z wieloma dostawcami.').'</p>';
+    $html .= '<div class="well">';
+    $html .= '<a class="btn btn-primary" href="'.htmlspecialchars($linkSources).'"><i class="icon-download"></i> '.$this->l('Open: Sources').'</a> ';
+    $html .= '<a class="btn btn-default" href="'.htmlspecialchars($linkRuns).'"><i class="icon-list"></i> '.$this->l('Open: Runs & Logs').'</a>';
+    $html .= '</div>';
+    $html .= '<p class="help-block">'.$this->l('Na początek: dodaj źródło dostawcy, wykonaj Dry Run, sprawdź diff, potem Real Run.').'</p>';
+
+    // Sekcja CRON
+    $html .= '<hr/><h4><i class="icon icon-time"></i> '.$this->l('CRON / CLI').'</h4>';
+    $html .= '<p><b>'.$this->l('Token:').'</b> <code>'.htmlspecialchars($token).'</code></p>';
+    $html .= '<p>'.$this->l('Sample URLs (replace {ID} with source ID):').'</p>';
+    $html .= '<ul style="margin-left:20px">';
+    $html .= '<li><code>'.htmlspecialchars($cronPatternDry).'</code></li>';
+    $html .= '<li><code>'.htmlspecialchars($cronPatternReal).'</code></li>';
+    $html .= '</ul>';
+    $html .= '<form method="post" action="">';
+    $html .= '<button class="btn btn-warning" name="regeneratePkshToken" value="1"><i class="icon-refresh"></i> '.$this->l('Regenerate token').'</button>';
+    $html .= '</form>';
+
+    $html .= '</div>';
+
+    return $html;
+    }
+
 }
