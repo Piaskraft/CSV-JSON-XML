@@ -24,6 +24,7 @@ class PkshRunService
         $row = $this->db->getRow('SELECT GET_LOCK("pksh_run_lock", 0) AS l');
         return isset($row['l']) && (int)$row['l'] === 1;
     }
+
     public function releaseLock(): void
     {
         $this->db->execute('SELECT RELEASE_LOCK("pksh_run_lock")');
@@ -92,7 +93,8 @@ class PkshRunService
             'old_qty'              => isset($data['old_qty']) ? (int)$data['old_qty'] : null,
             'new_qty'              => isset($data['new_qty']) ? (int)$data['new_qty'] : null,
             'reason'               => isset($data['reason']) ? pSQL(Tools::substr((string)$data['reason'], 0, 255)) : null,
-            'details'              => isset($data['details']) ? pSQL(Tools::substr((string)$data['details'], 65500)) : null,
+            // ✔️ poprawka: start=0, length=65500
+            'details'              => isset($data['details']) ? pSQL(Tools::substr((string)$data['details'], 0, 65500)) : null,
             'created_at'           => date('Y-m-d H:i:s'),
         ];
         return $this->db->insert('pksh_log', $row);
@@ -135,7 +137,8 @@ class PkshRunService
 
     public function runReal(int $idSource, int $idRun): array
     {
-        $this->guardPipelineAvailability(['DiffService','StockUpdater','PriceUpdater']);
+        // ✔️ GuardService dołączony do kontroli dostępności
+        $this->guardPipelineAvailability(['DiffService','StockUpdater','PriceUpdater','GuardService']);
 
         $diffService  = new DiffService();
         $stockUpdater = new StockUpdater();
@@ -165,11 +168,28 @@ class PkshRunService
             }
 
             try {
-                // snapshot PRZED
+                // snapshot PRZED zmianą
                 $cur = $this->readCurrentProductState($idProduct);
                 $this->snapshot($idRun, $idProduct, $cur);
 
-                /* GUARD: max_delta_pct (jeśli Diff podał delta; fallback liczymy sami) */
+                // GUARD #0 – walidacje twarde (EAN, negative price/qty, anomalie…)
+                $guard = new GuardService();
+                $guardRes = $guard->validateForUpdate($idProduct, $changes, $sourceCfg);
+                if (!$guardRes['ok']) {
+                    $this->log($idRun, 'skip', [
+                        'id_product' => $idProduct,
+                        'reason'     => $guardRes['reason'],
+                        'details'    => $guardRes['details'],
+                        'old_price'  => isset($cur['price']) ? (float)$cur['price'] : null,
+                        'new_price'  => isset($changes['price']) ? (float)$changes['price'] : null,
+                        'old_qty'    => isset($cur['quantity']) ? (int)$cur['quantity'] : null,
+                        'new_qty'    => isset($changes['quantity']) ? (int)$changes['quantity'] : null,
+                    ]);
+                    $stats['skipped']++;
+                    continue;
+                }
+
+                // GUARD #1 – max_delta_pct
                 if (isset($changes['price'])) {
                     $newPrice = (float)$changes['price'];
                     $oldPrice = isset($cur['price']) ? (float)$cur['price'] : null;
@@ -186,13 +206,12 @@ class PkshRunService
                                 'details'    => 'Δ='.$deltaPct.'% > '.$maxDelta.'%',
                             ]);
                             $stats['skipped']++;
-                            // usuń zmianę ceny, ale pozwól wykonać qty/active
-                            unset($changes['price']);
+                            unset($changes['price']); // pozwólmy nadal zmienić qty/active
                         }
                     }
                 }
 
-                /* ZAPIS: cena -> stan/aktywność */
+                // ZAPIS: cena -> stan/aktywność
                 if (array_key_exists('price', $changes)) {
                     $priceUpdater->apply($idProduct, [
                         'price' => (float)$changes['price'],
@@ -259,7 +278,14 @@ class PkshRunService
         $row = $this->db->getRow('SELECT id_shop, price_update_mode, tax_rule_group_id, zero_qty_policy, stock_buffer, max_delta_pct
             FROM '._DB_PREFIX_.'pksh_source WHERE id_source='.(int)$idSource);
         if (!$row) {
-            $row = ['id_shop'=>1,'price_update_mode'=>'impact','tax_rule_group_id'=>0,'zero_qty_policy'=>'disable','stock_buffer'=>0,'max_delta_pct'=>50.0];
+            $row = [
+                'id_shop'=>1,
+                'price_update_mode'=>'impact',
+                'tax_rule_group_id'=>0,
+                'zero_qty_policy'=>'disable',
+                'stock_buffer'=>0,
+                'max_delta_pct'=>50.0
+            ];
         }
         return $row;
     }
