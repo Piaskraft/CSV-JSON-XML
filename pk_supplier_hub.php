@@ -25,12 +25,17 @@ class Pk_Supplier_Hub extends Module
      *  INSTALL / UNINSTALL
      * ========================= */
 
-    public function install()
-    {
-        return parent::install()
-            && $this->installTabs()
-            && $this->installDb();
+   public function install()
+{
+    $ok = parent::install()
+        && $this->installTabs()
+        && $this->installDb();
+
+    if ($ok && !Configuration::get('PKSH_CRON_TOKEN')) {
+        Configuration::updateValue('PKSH_CRON_TOKEN', Tools::substr(sha1(_COOKIE_KEY_.microtime(true)), 0, 28));
     }
+    return $ok;
+}
 
     /**
      * Odinstalowanie:
