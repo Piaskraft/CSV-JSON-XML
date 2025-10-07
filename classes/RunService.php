@@ -86,7 +86,6 @@ class PkshRunService
 
     private function heartbeat(int $idRun, array $stats): void
     {
-        // aktualizacja statystyk „w locie” (widać progres w BO/DB)
         $fields = [
             'updated'    => (int)$stats['updated'],
             'skipped'    => (int)$stats['skipped'],
@@ -100,7 +99,6 @@ class PkshRunService
 
     public function log(int $idRun, string $action, array $data = []): bool
     {
-        // $data: id_product?, id_product_attribute?, old_price?, new_price?, old_qty?, new_qty?, reason?, details?
         $row = [
             'id_run'               => (int)$idRun,
             'id_product'           => isset($data['id_product']) ? (int)$data['id_product'] : null,
@@ -112,7 +110,6 @@ class PkshRunService
             'old_qty'              => isset($data['old_qty']) ? (int)$data['old_qty'] : null,
             'new_qty'              => isset($data['new_qty']) ? (int)$data['new_qty'] : null,
             'reason'               => isset($data['reason']) ? pSQL(Tools::substr((string)$data['reason'], 0, 255)) : null,
-            // ważne: tutaj length jest trzecim parametrem (start=0, length=65500)
             'details'              => isset($data['details']) ? pSQL(Tools::substr((string)$data['details'], 0, 65500)) : null,
             'created_at'           => date('Y-m-d H:i:s'),
         ];
@@ -121,7 +118,6 @@ class PkshRunService
 
     public function snapshot(int $idRun, int $idProduct, array $state): bool
     {
-        // $state: price?, quantity?, active?, id_product_attribute?
         $row = [
             'id_run'               => (int)$idRun,
             'id_product'           => (int)$idProduct,
@@ -156,7 +152,6 @@ class PkshRunService
 
     public function runReal(int $idSource, int $idRun): array
     {
-        // GuardService dołączony do kontroli dostępności
         $this->guardPipelineAvailability(['DiffService','StockUpdater','PriceUpdater','GuardService']);
 
         $diffService  = new DiffService();
@@ -175,7 +170,7 @@ class PkshRunService
         $items = $diff['items'];
         $stats['total'] = count($items);
 
-        // od razu wpisz total, żeby BO widział rozmiar pracy
+        // zapisz „total”, żeby BO widział rozmiar pracy
         $this->db->update('pksh_run', [
             'total'      => (int)$stats['total'],
             'updated_at' => date('Y-m-d H:i:s'),
@@ -196,14 +191,13 @@ class PkshRunService
                 if ($idProduct <= 0 || empty($changes)) {
                     $this->log($idRun, 'skip', ['id_product'=>$idProduct, 'reason'=>'missing id_product or changes']);
                     $stats['skipped']++;
-                    // heartbeat co N rekordów
                     if (($processed % $this->heartbeatEvery) === 0) { $this->heartbeat($idRun, $stats); }
                     continue;
                 }
 
                 try {
-                    // snapshot PRZED zmianą
-                    $cur = $this->readCurrentProductState($idProduct);
+                    // snapshot PRZED zmianą (multistore-aware)
+                    $cur = $this->readCurrentProductStateShop($idProduct, (int)$sourceCfg['id_shop']);
                     $this->snapshot($idRun, $idProduct, $cur);
 
                     // GUARD #0 – twarde walidacje
@@ -241,12 +235,12 @@ class PkshRunService
                                     'details'    => 'Δ='.$deltaPct.'% > '.$maxDelta.'%',
                                 ]);
                                 $stats['skipped']++;
-                                unset($changes['price']); // pozwólmy nadal zmienić qty/active
+                                unset($changes['price']); // nadal pozwolimy zrobić qty/active
                             }
                         }
                     }
 
-                    // ZAPIS: cena -> stan/aktywność
+                    // ZAPIS: cena
                     if (array_key_exists('price', $changes)) {
                         $priceUpdater->apply($idProduct, [
                             'price' => (float)$changes['price'],
@@ -263,6 +257,7 @@ class PkshRunService
                         ]);
                     }
 
+                    // ZAPIS: stan/aktywność
                     if (array_key_exists('quantity', $changes) || array_key_exists('active', $changes)) {
                         $stockUpdater->apply($idProduct, [
                             'quantity' => $changes['quantity'] ?? null,
@@ -290,7 +285,6 @@ class PkshRunService
                     $stats['errors']++;
                 }
 
-                // heartbeat co N rekordów
                 if (($processed % $this->heartbeatEvery) === 0) {
                     $this->heartbeat($idRun, $stats);
                 }
@@ -306,16 +300,40 @@ class PkshRunService
 
     /* ========== HELPERS ========== */
 
-    private function readCurrentProductState(int $idProduct): array
+    /**
+     * Odczyt stanu produktu z uwzględnieniem id_shop.
+     * Fallback do stock_available(id_shop=0) TYLKO jeśli quantity jest NULL (brak wpisu),
+     * NIE gdy quantity=0 (bo 0 może być poprawną wartością).
+     */
+    private function readCurrentProductStateShop(int $idProduct, int $idShop): array
     {
         $row = $this->db->getRow('
-            SELECT p.active, p.price, IFNULL(sa.quantity, 0) as quantity
-            FROM '._DB_PREFIX_.'product p
+            SELECT p.active, ps.price, sa.quantity
+            FROM '._DB_PREFIX_.'product_shop ps
+            INNER JOIN '._DB_PREFIX_.'product p ON p.id_product=ps.id_product
             LEFT JOIN '._DB_PREFIX_.'stock_available sa
-                ON sa.id_product=p.id_product AND sa.id_product_attribute=0
-            WHERE p.id_product='.(int)$idProduct
+                ON sa.id_product=ps.id_product AND sa.id_product_attribute=0 AND sa.id_shop='.(int)$idShop.'
+            WHERE ps.id_product='.(int)$idProduct.' AND ps.id_shop='.(int)$idShop
         );
-        return is_array($row) ? $row : [];
+
+        if (!is_array($row)) { return []; }
+
+        if ($row['quantity'] === null && (int)$idShop !== 0) {
+            $qty0 = $this->db->getValue('
+                SELECT quantity FROM '._DB_PREFIX_.'stock_available
+                WHERE id_product='.(int)$idProduct.' AND id_product_attribute=0 AND id_shop=0
+                LIMIT 1
+            ');
+            if ($qty0 !== false && $qty0 !== null) {
+                $row['quantity'] = (int)$qty0;
+            } else {
+                $row['quantity'] = 0;
+            }
+        } else {
+            $row['quantity'] = (int)$row['quantity'];
+        }
+
+        return $row;
     }
 
     private function getSourceConfig(int $idSource): array
