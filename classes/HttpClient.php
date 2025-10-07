@@ -2,249 +2,189 @@
 if (!defined('_PS_VERSION_')) { exit; }
 
 /**
- * Prosty HTTP GET z obsługą:
- * - auth: none/basic/bearer/header/query
- * - timeout, retry (exponential backoff)
- * - limit rozmiaru (maxBytes)
- * - whitelist MIME
+ * HttpClient – bezpieczne pobieranie feedów (timeout/retry/rate-limit/CT whitelist).
+ * Działa na curl, nie wymaga zewnętrznych bibliotek.
  */
-class PkshHttpClient
+class HttpClient
 {
-    public function get(string $url, array $opts = []): array
+    // twarde limity (sekundy)
+    private $connectTimeout = 5;
+    private $responseTimeout = 20;
+
+    // retry
+    private $maxRetries = 2;         // łącznie do 3 prób (1 + 2 retry)
+    private $retryDelayBaseMs = 300; // backoff: 300ms, 600ms...
+
+    // rate limit (na host) – max N zapytań na okno czasu
+    private static $bucket = [];       // [host] => ['count'=>..,'windowStart'=>..]
+    private $rateLimitPerWindow = 6;   // 6 żądań
+    private $rateWindowSeconds = 2;    // co 2 sekundy okno
+
+    // whitelist nagłówka Content-Type
+    private $allowedContentTypes = [
+        'text/csv','application/csv','text/plain',
+        'application/json','text/json',
+        'application/xml','text/xml',
+        'application/octet-stream' // część hurtowni tak zwraca CSV
+    ];
+
+    // opcjonalna autoryzacja i nagłówki
+    private $authType = 'none'; // none|basic|bearer
+    private $authUser;
+    private $authPassOrToken;
+    private $headers = []; // dodatkowe nagłówki ['Header: value']
+
+    public function __construct(array $opts = [])
     {
-        $timeout  = (int)($opts['timeout']  ?? 10);        // sekundy
-        $retries  = (int)($opts['retries']  ?? 2);
-        $maxBytes = (int)($opts['maxBytes'] ?? 20 * 1024 * 1024); // 20 MB
-        $auth     = (array)($opts['auth']   ?? []);        // ['type'=>'basic|bearer|header|query', ...]
-        $headers  = (array)($opts['headers']?? []);        // assoc
-        $query    = (array)($opts['query']  ?? []);        // assoc
-        $allowCt  = (array)($opts['allowContentTypes'] ?? [
-            'text/csv','application/csv',
-            'application/json','text/json',
-            'application/xml','text/xml'
-        ]);
+        if (isset($opts['connect_timeout'])) $this->connectTimeout = (int)$opts['connect_timeout'];
+        if (isset($opts['response_timeout'])) $this->responseTimeout = (int)$opts['response_timeout'];
+        if (isset($opts['max_retries'])) $this->maxRetries = (int)$opts['max_retries'];
+        if (isset($opts['rate_limit'])) $this->rateLimitPerWindow = (int)$opts['rate_limit'];
+        if (isset($opts['rate_window'])) $this->rateWindowSeconds = (int)$opts['rate_window'];
+        if (isset($opts['auth_type'])) $this->authType = (string)$opts['auth_type'];
+        if (isset($opts['auth_user'])) $this->authUser = (string)$opts['auth_user'];
+        if (isset($opts['auth_pass_or_token'])) $this->authPassOrToken = (string)$opts['auth_pass_or_token'];
+        if (isset($opts['headers']) && is_array($opts['headers'])) $this->headers = $opts['headers'];
+    }
 
-        // auth: header/query helpers (dane z BO mogą przyjść jako JSON-string)
-        $headers = $this->normalizeAssoc($headers);
-        $query   = $this->normalizeAssoc($query);
-
-        // auth injection
-        switch (($auth['type'] ?? 'none')) {
-            case 'basic':
-                // handled via CURLOPT_USERPWD
-                break;
-            case 'bearer':
-                if (!empty($auth['token'])) {
-                    $headers['Authorization'] = 'Bearer '.$auth['token'];
-                }
-                break;
-            case 'header':
-                // ex: auth.headers JSON merged into $headers in BO, więc nic więcej
-                break;
-            case 'query':
-                // ex: auth.query_params JSON merged into $query in BO, więc nic więcej
-                break;
-            case 'none':
-            default:
-                break;
-        }
-
-        // dołącz query do URL
-        if (!empty($query)) {
-            $url = $this->appendQuery($url, $query);
-        }
+    public function get(string $url): array
+    {
+        $host = parse_url($url, PHP_URL_HOST) ?: 'unknown-host';
+        $this->throttle($host);
 
         $attempt = 0;
-        $delayMs = 200;
+        $lastErr = null;
 
         do {
-            $attempt++;
-            $res = $this->curlGet($url, [
-                'timeout'   => $timeout,
-                'maxBytes'  => $maxBytes,
-                'headers'   => $headers,
-                'auth_type' => ($auth['type'] ?? 'none'),
-                'userpwd'   => (!empty($auth['login']) || !empty($auth['password']))
-                                ? (($auth['login'] ?? '').':'.($auth['password'] ?? ''))
-                                : null,
-            ]);
-
-            // Akceptowalne CT?
-            if ($res['status'] >= 200 && $res['status'] < 300) {
-                $ct = strtolower($res['contentType'] ?? '');
-                // czasem CT zawiera ;charset=...
-                $ctBase = trim(explode(';', $ct)[0]);
-                if (!in_array($ctBase, $allowCt, true)) {
-                    return [
-                        'ok' => false,
-                        'status' => 415,
-                        'error' => 'Unsupported Content-Type: '.$res['contentType'],
-                        'contentType' => $res['contentType'],
-                        'body' => null,
-                    ];
+            try {
+                $attempt++;
+                $res = $this->request('GET', $url);
+                $this->assertContentType($res['headers']);
+                return $res;
+            } catch (\Throwable $e) {
+                $lastErr = $e;
+                if ($attempt > $this->maxRetries + 1) {
+                    break;
                 }
-                return [
-                    'ok'          => true,
-                    'status'      => $res['status'],
-                    'body'        => $res['body'],
-                    'contentType' => $res['contentType'],
-                    'size'        => $res['size'],
-                ];
-            }
-
-            // retry only on 5xx / timeout / network
-            $shouldRetry = ($res['status'] === 0 || ($res['status'] >= 500 && $res['status'] < 600));
-            if ($shouldRetry && $attempt <= ($retries + 1)) {
-                usleep($delayMs * 1000);
-                $delayMs = min(2000, $delayMs * 2);
-            } else {
-                break;
+                // proste exponential backoff
+                usleep($this->retryDelayBaseMs * 1000 * $attempt);
             }
         } while (true);
 
-        return [
-            'ok'          => false,
-            'status'      => $res['status'],
-            'error'       => $res['error'] ?? 'Request failed',
-            'contentType' => $res['contentType'] ?? null,
-            'body'        => null,
-        ];
+        throw new \RuntimeException('HttpClient GET failed: '.$lastErr->getMessage());
     }
 
-    /** ------------ helpers ------------ */
+    /* ====================== INTERNALS ====================== */
 
-    protected function curlGet(string $url, array $opts): array
+    private function request(string $method, string $url, ?string $body = null): array
     {
         $ch = curl_init();
-        $responseBody = '';
-        $size = 0;
-        $maxBytes = (int)$opts['maxBytes'];
-
-        // write callback to enforce maxBytes
-        $writeFn = function ($ch, $data) use (&$responseBody, &$size, $maxBytes) {
-            $len = strlen($data);
-            $size += $len;
-            if ($size > $maxBytes) {
-                return 0; // abort transfer
-            }
-            $responseBody .= $data;
-            return $len;
-        };
-
-        $httpHeaders = [];
-        foreach ((array)$opts['headers'] as $k => $v) {
-            $httpHeaders[] = $k.': '.$v;
-        }
+        $headerBag = $this->buildHeaders();
 
         curl_setopt_array($ch, [
-            CURLOPT_URL => $url,
-            CURLOPT_RETURNTRANSFER => false, // używamy WRITEFUNCTION
-            CURLOPT_WRITEFUNCTION  => $writeFn,
+            CURLOPT_URL            => $url,
+            CURLOPT_CUSTOMREQUEST  => $method,
+            CURLOPT_RETURNTRANSFER => true,
             CURLOPT_FOLLOWLOCATION => true,
-            CURLOPT_MAXREDIRS      => 3,
-            CURLOPT_CONNECTTIMEOUT => (int)$opts['timeout'],
-            CURLOPT_TIMEOUT        => (int)$opts['timeout'],
-            CURLOPT_HTTPHEADER     => $httpHeaders,
-            CURLOPT_USERAGENT      => 'PKSupplierHub/1.0 (+Prestashop)',
+            CURLOPT_CONNECTTIMEOUT => $this->connectTimeout,
+            CURLOPT_TIMEOUT        => $this->responseTimeout,
+            CURLOPT_HTTPHEADER     => $headerBag,
+            CURLOPT_HEADER         => true,
             CURLOPT_SSL_VERIFYPEER => true,
             CURLOPT_SSL_VERIFYHOST => 2,
-            CURLOPT_HEADER => true,
         ]);
 
-        // Basic auth
-        if (($opts['auth_type'] ?? 'none') === 'basic' && !empty($opts['userpwd'])) {
+        if ($method !== 'GET' && $body !== null) {
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $body);
+        }
+
+        // auth
+        if ($this->authType === 'basic' && $this->authUser !== null) {
             curl_setopt($ch, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-            curl_setopt($ch, CURLOPT_USERPWD, $opts['userpwd']);
+            curl_setopt($ch, CURLOPT_USERPWD, $this->authUser.':'.($this->authPassOrToken ?? ''));
         }
 
-        $headerStr = '';
-        curl_setopt($ch, CURLOPT_HEADERFUNCTION, function ($ch, $header) use (&$headerStr) {
-            $headerStr .= $header;
-            return strlen($header);
-        });
-
-        $ok = curl_exec($ch);
-
-        $err     = null;
-        $status  = 0;
-        $ct      = null;
-
-        if ($ok === false) {
+        $raw = curl_exec($ch);
+        if ($raw === false) {
             $err = curl_error($ch);
-        } else {
-            $status = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-            // parse headers to find content-type
-            foreach (preg_split("/\r\n|\n|\r/", $headerStr) as $line) {
-                if (stripos($line, 'Content-Type:') === 0) {
-                    $ct = trim(substr($line, strlen('Content-Type:')));
-                    break;
-                }
-            }
+            $code = curl_errno($ch);
+            curl_close($ch);
+            throw new \RuntimeException('cURL error #'.$code.': '.$err);
         }
 
+        $status = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        $headerSize = curl_getinfo($ch, CURLINFO_HEADER_SIZE);
         curl_close($ch);
 
-        // jeśli przerwane przez maxBytes, ustaw pseudo-błąd 413
-        if ($size > $maxBytes) {
-            return [
-                'status' => 413,
-                'error' => 'Payload too large (>'.(int)($maxBytes/1024/1024).' MB)',
-                'contentType' => $ct,
-                'body' => null,
-                'size' => $size,
-            ];
+        $rawHeaders = substr($raw, 0, $headerSize);
+        $body = substr($raw, $headerSize);
+
+        if ($status < 200 || $status >= 300) {
+            throw new \RuntimeException('HTTP status '.$status.' for URL '.$url);
         }
 
-        return [
-            'status'      => $status,
-            'error'       => $err,
-            'contentType' => $ct,
-            'body'        => $ok === false ? null : $this->ensureUtf8($responseBody),
-            'size'        => $size,
-        ];
+        $headers = $this->parseHeaders($rawHeaders);
+        return ['status'=>$status, 'headers'=>$headers, 'body'=>$body];
     }
 
-    protected function appendQuery(string $url, array $params): string
+    private function buildHeaders(): array
     {
-        $parts = parse_url($url);
-        $query = [];
-        if (!empty($parts['query'])) {
-            parse_str($parts['query'], $query);
+        $h = array_values($this->headers);
+        // Bearer
+        if ($this->authType === 'bearer' && $this->authPassOrToken) {
+            $h[] = 'Authorization: Bearer '.$this->authPassOrToken;
         }
-        $query = array_merge($query, $params);
-        $parts['query'] = http_build_query($query);
-
-        $scheme   = $parts['scheme'] ?? 'http';
-        $host     = $parts['host'] ?? '';
-        $port     = isset($parts['port']) ? ':'.$parts['port'] : '';
-        $path     = $parts['path'] ?? '';
-        $queryStr = isset($parts['query']) && $parts['query'] !== '' ? '?'.$parts['query'] : '';
-        $frag     = isset($parts['fragment']) ? '#'.$parts['fragment'] : '';
-
-        return $scheme.'://'.$host.$port.$path.$queryStr.$frag;
+        // sensowne UA
+        $h[] = 'User-Agent: PKSupplierHub/1.0 (+PrestaShop)';
+        return $h;
     }
 
-    protected function normalizeAssoc($maybeJson): array
+    private function parseHeaders(string $raw): array
     {
-        if (is_array($maybeJson)) {
-            return $maybeJson;
-        }
-        if (is_string($maybeJson) && $maybeJson !== '') {
-            $decoded = json_decode($maybeJson, true);
-            if (json_last_error() === JSON_ERROR_NONE && is_array($decoded)) {
-                return $decoded;
+        $lines = preg_split('/\r\n|\n|\r/', trim($raw));
+        $res = [];
+        foreach ($lines as $line) {
+            if (strpos($line, ':') !== false) {
+                [$k, $v] = array_map('trim', explode(':', $line, 2));
+                $res[strtolower($k)] = $v;
             }
         }
-        return [];
+        return $res;
     }
 
-    protected function ensureUtf8(?string $s): ?string
+    private function assertContentType(array $headers): void
     {
-        if ($s === null) return null;
-        // jeśli nie-UTF8, spróbuj konwersji
-        if (!mb_check_encoding($s, 'UTF-8')) {
-            $s = @mb_convert_encoding($s, 'UTF-8', 'auto,ISO-8859-2,Windows-1250,Windows-1252');
+        if (!isset($headers['content-type'])) {
+            // część serwerów nie wysyła — wtedy przepuszczamy
+            return;
         }
-        return $s;
+        $ct = strtolower(trim(explode(';', $headers['content-type'])[0]));
+        if (!in_array($ct, $this->allowedContentTypes, true)) {
+            throw new \RuntimeException('Disallowed Content-Type: '.$ct);
+        }
+    }
+
+    private function throttle(string $host): void
+    {
+        $now = time();
+        if (!isset(self::$bucket[$host])) {
+            self::$bucket[$host] = ['count'=>0,'windowStart'=>$now];
+        }
+        $win = &self::$bucket[$host];
+        if (($now - $win['windowStart']) >= $this->rateWindowSeconds) {
+            $win['windowStart'] = $now;
+            $win['count'] = 0;
+        }
+        if ($win['count'] >= $this->rateLimitPerWindow) {
+            // proste czekanie do końca okna, ale krótkie (max 1s)
+            $sleep = max(0, $this->rateWindowSeconds - ($now - $win['windowStart']));
+            if ($sleep > 0) {
+                usleep(min(1000000, $sleep * 1000000));
+            }
+            // po „drzemce” reset okna
+            $win['windowStart'] = time();
+            $win['count'] = 0;
+        }
+        $win['count']++;
     }
 }

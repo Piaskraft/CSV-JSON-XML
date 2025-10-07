@@ -1,145 +1,249 @@
 <?php
 if (!defined('_PS_VERSION_')) { exit; }
 
-require_once __DIR__.'/HttpClient.php';
-require_once __DIR__.'/parsers/ParserFactory.php';
-require_once __DIR__.'/FeedNormalizer.php';
-require_once __DIR__.'/FeedValidator.php';
-require_once __DIR__.'/EcbProvider.php';
-require_once __DIR__.'/Pricing.php';
-
-class PkshPreviewService
+/**
+ * PreviewService – pobiera feed źródła HttpClientem, parsuje (ParserFactory lub fallback),
+ * normalizuje i waliduje (jeśli klasy istnieją), zwraca pierwsze N rekordów + metryki.
+ *
+ * Działa „na sucho”: jeśli ParserFactory/FeedNormalizer/FeedValidator nie istnieją,
+ * ma własne proste fallbacki dla CSV/JSON/XML.
+ */
+class PreviewService
 {
-    public function run(PkshSource $source, int $limit = 50): array
-    {
-        $t0 = microtime(true);
+    /** @var Db */
+    private $db;
 
-        // 1) Pobierz plik
-        $http = new PkshHttpClient();
-        $res = $http->get((string)$source->url, [
-            'timeout' => 10,
-            'retries' => 2,
-            'maxBytes' => 20 * 1024 * 1024,
-            'auth' => [
-                'type'     => (string)$source->auth_type,
-                'login'    => (string)$source->auth_login,
-                'password' => (string)$source->auth_password,
-                'token'    => (string)$source->auth_token,
-            ],
-            'headers' => (string)$source->headers,
-            'query'   => (string)$source->query_params,
+    public function __construct()
+    {
+        $this->db = Db::getInstance();
+    }
+
+    /**
+     * @return array ['items'=>[...], 'metrics'=>[...], 'content_type'=>string]
+     */
+    public function preview(int $idSource, int $limit = 50): array
+    {
+        $src = $this->getSource($idSource);
+        if (!$src) {
+            return ['items'=>[], 'metrics'=>['error'=>'source_not_found'], 'content_type'=>null];
+        }
+        if (empty($src['active'])) {
+            return ['items'=>[], 'metrics'=>['error'=>'source_inactive'], 'content_type'=>null];
+        }
+
+        // HttpClient z konfiguracją źródła
+        $http = new HttpClient([
+            'connect_timeout' => 5,
+            'response_timeout'=> 20,
+            'max_retries'     => 2,
+            'rate_limit'      => 6,
+            'rate_window'     => 2,
+            'auth_type'       => $src['auth_type'] ?: 'none',
+            'auth_user'       => $src['auth_user'] ?: null,
+            'auth_pass_or_token' => $this->resolveSecret($src),
+            'headers'         => $this->decodeHeaders($src['headers_json'] ?? null),
         ]);
 
-        if (!$res['ok']) {
-            return [
-                'ok' => false,
-                'error' => 'HTTP '.$res['status'].': '.($res['error'] ?? 'download failed'),
-            ];
+        // 1) pobierz
+        $res = $http->get($src['url']);
+        $ct = $this->resolveContentType($res['headers'], $src['type']); // content-type → csv/json/xml
+        $raw = $res['body'];
+
+        // 2) parsuj (fabryka lub fallback)
+        $items = $this->parse($ct, $raw);
+
+        // 3) normalizuj, waliduj (jeśli klasy istnieją)
+        if (class_exists('FeedNormalizer')) {
+            $norm = new FeedNormalizer();
+            $items = $norm->normalize($items, $src); // np. ceny netto, mapowanie pól
+        }
+        $metrics = $this->buildMetrics($items);
+        if (class_exists('FeedValidator')) {
+            $val = new FeedValidator();
+            $report = $val->validateSample($items);
+            $metrics['validation'] = $report;
         }
 
-        // 2) Parser
-        $parser = PkshParserFactory::make((string)$source->file_type);
-        $cfg = [
-            'delimiter'  => (string)$source->delimiter,
-            'enclosure'  => (string)$source->enclosure,
-            'items_path' => (string)$source->items_path,
-            'item_xpath' => (string)$source->item_xpath,
-        ];
-        $parsed = $parser->parse($res['body'], $cfg);
-
-        $normalizer = new PkshFeedNormalizer();
-        $validator  = new PkshFeedValidator();
-        $rates      = new PkshEcbProvider();
-        $pricing    = new PkshPricing();
-
-        $rows = [];
-        $metrics = [
-            'total_in_feed' => (int)$parsed['total'],
-            'scanned'       => 0,
-            'valid'         => 0,
-            'with_warnings' => 0,
-            'errors'        => 0,
-            'rate_mode'     => (string)$source->rate_mode,
-            'rate_used'     => null,
-        ];
-
-        $sourceCfg = [
-            'map_col_key'       => (string)$source->map_col_key,
-            'map_col_price'     => (string)$source->map_col_price,
-            'map_col_qty'       => (string)$source->map_col_qty,
-            'map_col_variant'   => (string)$source->map_col_variant,
-            'price_currency'    => (string)$source->price_currency,
-            'rate_mode'         => (string)$source->rate_mode,
-            'fixed_rate'        => (float)$source->fixed_rate,
-            'margin_mode'       => (string)$source->margin_mode,
-            'margin_fixed_pct'  => (float)$source->margin_fixed_pct,
-            'margin_tiers'      => (string)$source->margin_tiers,
-            'ending_mode'       => (string)$source->ending_mode,
-            'ending_value'      => (string)$source->ending_value,
-            'min_margin_pct'    => (float)$source->min_margin_pct,
-        ];
-
-        foreach ($parsed['records'] as $raw) {
-            $metrics['scanned']++;
-
-            // a) normalize
-            $norm = $normalizer->normalize($raw, $sourceCfg);
-
-            // b) validate
-            $val  = $validator->validate($norm, $sourceCfg);
-            $ok   = $val['ok'];
-            $errs = $val['errors'];
-            $warn = array_merge($norm['warnings'] ?? [], $val['warnings']);
-
-            if (!$ok) {
-                $metrics['errors']++;
-            }
-
-            // c) pricing – tylko jeśli brak błędów kluczowych
-            $priceRes = ['price_eur'=>null,'price_target'=>null,'rate_used'=>null,'warnings'=>[]];
-            if ($ok) {
-                $priceRes = $pricing->compute($val['row'], $sourceCfg, $rates);
-                if (!empty($priceRes['error'])) {
-                    $ok = false;
-                    $errs[] = $priceRes['error'];
-                } else {
-                    if ($metrics['rate_used'] === null && isset($priceRes['rate_used'])) {
-                        $metrics['rate_used'] = $priceRes['rate_used'];
-                    }
-                    if (!empty($priceRes['warnings'])) {
-                        $warn = array_merge($warn, $priceRes['warnings']);
-                    }
-                }
-            }
-
-            if ($ok) $metrics['valid']++;
-            if (!empty($warn)) $metrics['with_warnings']++;
-
-            // d) do tabeli (limit 50)
-            if (count($rows) < $limit) {
-                $rows[] = [
-                    'key'          => $val['row']['key'],
-                    'price_raw'    => $val['row']['price_raw'],
-                    'qty_raw'      => $val['row']['qty_raw'],
-                    'price_eur'    => $priceRes['price_eur'],
-                    'price_target' => $priceRes['price_target'],
-                    'warnings'     => $warn,
-                    'errors'       => $errs,
-                ];
-            }
-
-            // prosty bezpiecznik na ogromne feedy
-            if ($metrics['scanned'] > 100000) {
-                break;
-            }
-        }
-
-        $metrics['duration_ms'] = (int)round((microtime(true) - $t0) * 1000);
+        // 4) przytnij do limitu
+        $slice = array_slice($items, 0, max(1, (int)$limit));
 
         return [
-            'ok'      => true,
-            'rows'    => $rows,
-            'metrics' => $metrics,
+            'items' => $slice,
+            'metrics' => array_merge($metrics, [
+                'content_type' => $ct,
+                'total_in_feed'=> count($items),
+            ]),
+            'content_type' => $ct,
+        ];
+    }
+
+    /* ====================== INTERNALS ====================== */
+
+    private function getSource(int $id): ?array
+    {
+        $row = $this->db->getRow('SELECT * FROM '._DB_PREFIX_.'pksh_source WHERE id_source='.(int)$id);
+        return $row ?: null;
+    }
+
+    private function resolveSecret(array $src)
+    {
+        // preferuj pass dla basic, token dla bearer
+        if (($src['auth_type'] ?? '') === 'basic') {
+            return $src['auth_pass'] ?? null;
+        }
+        if (($src['auth_type'] ?? '') === 'bearer') {
+            return $src['auth_token'] ?? null;
+        }
+        return null;
+    }
+
+    private function decodeHeaders(?string $json): array
+    {
+        if (!$json) return [];
+        $arr = json_decode($json, true);
+        if (!is_array($arr)) return [];
+        $out = [];
+        foreach ($arr as $k=>$v) {
+            $out[] = trim($k).': '.trim((string)$v);
+        }
+        return $out;
+    }
+
+    /**
+     * Mapa nagłówka/typu źródła do parsera: csv|json|xml
+     */
+    private function resolveContentType(array $headers, ?string $fallback): string
+    {
+        $ct = isset($headers['content-type']) ? strtolower(trim(explode(';', $headers['content-type'])[0])) : '';
+        if (strpos($ct, 'json') !== false) return 'json';
+        if (strpos($ct, 'xml')  !== false) return 'xml';
+        if (strpos($ct, 'csv')  !== false || strpos($ct, 'text/plain') !== false) return 'csv';
+        // fallback z definicji źródła
+        $f = strtolower((string)$fallback);
+        if (in_array($f, ['csv','json','xml'], true)) return $f;
+        // domyślnie: json
+        return 'json';
+        }
+
+    /**
+     * Główna logika parsowania – używa ParserFactory jeśli istnieje,
+     * inaczej proste fallbacki dla CSV/JSON/XML.
+     * @return array of associative arrays
+     */
+    private function parse(string $type, string $raw): array
+    {
+        if (class_exists('ParserFactory')) {
+            $factory = new ParserFactory();
+            $parser = $factory->make($type); // zakładamy signaturę make($type)
+            if (is_object($parser) && method_exists($parser, 'parse')) {
+                $out = $parser->parse($raw);
+                return is_array($out) ? $out : [];
+            }
+        }
+
+        // fallback własny
+        switch ($type) {
+            case 'csv':
+                return $this->parseCsv($raw);
+            case 'xml':
+                return $this->parseXml($raw);
+            case 'json':
+            default:
+                return $this->parseJson($raw);
+        }
+    }
+
+    private function parseJson(string $raw): array
+    {
+        $data = json_decode($raw, true);
+        if (is_array($data)) {
+            // jeśli root ma klucz 'items' lub 'products' itp.
+            foreach (['items','products','data','rows'] as $k) {
+                if (isset($data[$k]) && is_array($data[$k])) {
+                    return $data[$k];
+                }
+            }
+            // jeśli tablica tablic
+            if (!empty($data) && isset($data[0]) && is_array($data[0])) {
+                return $data;
+            }
+            // jeśli obiekty proste – opakuj
+            return [$data];
+        }
+        return [];
+    }
+
+    private function parseCsv(string $raw): array
+    {
+        $rows = [];
+        $fh = fopen('php://temp', 'r+');
+        fwrite($fh, $raw);
+        rewind($fh);
+        $header = null;
+        while (($row = fgetcsv($fh, 0, ';')) !== false) {
+            if ($header === null) {
+                // wykryj separator (próba , ;)
+                if (count($row) === 1) {
+                    rewind($fh); ftruncate($fh, 0); fwrite($fh, str_replace(';', ',', $raw)); rewind($fh);
+                    $row = fgetcsv($fh, 0, ',');
+                }
+                $header = $row;
+                continue;
+            }
+            $assoc = [];
+            foreach ($header as $i=>$h) {
+                $assoc[trim((string)$h)] = $row[$i] ?? null;
+            }
+            $rows[] = $assoc;
+            if (count($rows) > 50000) break; // twardy limit sanity
+        }
+        fclose($fh);
+        return $rows;
+    }
+
+    private function parseXml(string $raw): array
+    {
+        $xml = @simplexml_load_string($raw, 'SimpleXMLElement', LIBXML_NOENT | LIBXML_NOCDATA);
+        if (!$xml) { return []; }
+        $json = json_decode(json_encode($xml), true);
+        // heurystyka: znajdź największą tablicę w drzewie
+        $flat = $this->findLargestArray($json);
+        return is_array($flat) ? $flat : [];
+    }
+
+    private function findLargestArray($node)
+    {
+        if (is_array($node)) {
+            $best = null; $bestCount = 0;
+            if ($this->isList($node)) { $best = $node; $bestCount = count($node); }
+            foreach ($node as $v) {
+                $cand = $this->findLargestArray($v);
+                $c = is_array($cand) ? count($cand) : 0;
+                if ($c > $bestCount) { $best = $cand; $bestCount = $c; }
+            }
+            return $best;
+        }
+        return null;
+    }
+    private function isList(array $arr): bool
+    {
+        return array_keys($arr) === range(0, count($arr)-1);
+    }
+
+    private function buildMetrics(array $items): array
+    {
+        $total = count($items);
+        $keys = [];
+        $nulls = 0;
+        foreach (array_slice($items, 0, 200) as $row) {
+            if (is_array($row)) {
+                foreach ($row as $k=>$v) { $keys[$k] = true; if ($v === null || $v === '') { $nulls++; } }
+            }
+        }
+        return [
+            'total_sampled' => min(200, $total),
+            'unique_keys'   => count($keys),
+            'null_fields_in_sample' => $nulls,
         ];
     }
 }
